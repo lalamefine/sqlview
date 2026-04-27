@@ -12,7 +12,7 @@ Une application Go pour lire un dossier de fichiers SQL, exécuter chaque requê
 ## Variables d’environnement
 
 - `DATABASE_URL` : URL de connexion à la base de données.
-- `SQL_DIR` : dossier contenant les fichiers `.sql` (par défaut `/queries`).
+- `SQL_DIR` : dossier contenant les fichiers `.sql`. Si non défini, l’application recherche `queries`, puis `doc`, puis le répertoire courant.
 - `ADDR` : adresse d’écoute HTTP (par défaut `:8080`).
 
 ## Exemples
@@ -44,11 +44,13 @@ docker run --rm -p 8080:8080 \
 
 ## Utilisation dans une iframe
 
-Sur ta page principale, tu peux intégrer un fichier SQL avec :
+Pour un aperçu minimal contenant uniquement la table et sans navigation, utilise l’endpoint `/iframe/<nom>` :
 
 ```html
-<iframe src="http://localhost:8080/view/mon_fichier" style="width:100%; height:800px; border: none;"></iframe>
+<iframe src="http://localhost:8080/iframe/mon_fichier" style="width:100%; height:800px; border: none;"></iframe>
 ```
+
+Tu peux toujours utiliser `/view/<nom>` pour une version complète avec la requête visible et le lien de retour.
 
 ## Notes
 

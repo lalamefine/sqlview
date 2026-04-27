@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	defaultSQLDir = "/queries"
+	defaultSQLDir = "queries"
 	defaultAddr   = ":8080"
 )
 
@@ -42,6 +42,7 @@ type ListPageData struct {
 }
 
 type ViewPageData struct {
+	Name    string
 	Title   string
 	Query   string
 	Headers []string
@@ -57,7 +58,14 @@ func main() {
 
 	sqlDir := strings.TrimSpace(os.Getenv("SQL_DIR"))
 	if sqlDir == "" {
-		sqlDir = defaultSQLDir
+		var err error
+		sqlDir, err = resolveSQLDir()
+		if err != nil {
+			log.Fatalf("cannot resolve SQL_DIR: %v", err)
+		}
+	}
+	if err := os.MkdirAll(sqlDir, 0755); err != nil {
+		log.Fatalf("failed to prepare SQL_DIR directory %s: %v", sqlDir, err)
 	}
 
 	addr := strings.TrimSpace(os.Getenv("ADDR"))
@@ -118,6 +126,24 @@ func main() {
 		renderView(w, db, queryFile)
 	})
 
+	http.HandleFunc("/iframe/", func(w http.ResponseWriter, r *http.Request) {
+		name, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/iframe/"))
+		if err != nil || name == "" {
+			http.NotFound(w, r)
+			return
+		}
+		queryFile, ok := queryMap[name]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		renderIframe(w, db, queryFile)
+	})
+
+	http.HandleFunc("/favicon.svg", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "favicon.svg")
+	})
+
 	log.Printf("starting sqlview on %s, serving queries from %s", addr, sqlDir)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
@@ -143,12 +169,61 @@ func parseDatabaseURL(raw string) (string, string, error) {
 		}
 		return "sqlite", dsn, nil
 	case "postgres", "postgresql":
-		return "postgres", raw, nil
+		q := u.Query()
+		if q.Get("sslmode") == "" {
+			q.Set("sslmode", "disable")
+			u.RawQuery = q.Encode()
+		}
+		return "postgres", u.String(), nil
 	case "mysql":
 		return "mysql", raw, nil
 	default:
 		return "", "", fmt.Errorf("unsupported database scheme %q", scheme)
 	}
+}
+
+func resolveSQLDir() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	candidates := []string{
+		filepath.Join(cwd, "queries"),
+		filepath.Join(cwd, "doc"),
+		cwd,
+	}
+
+	for _, candidate := range candidates {
+		if dirExists(candidate) {
+			if containsSQLFiles(candidate) || filepath.Base(candidate) == defaultSQLDir {
+				return candidate, nil
+			}
+		}
+	}
+
+	return filepath.Join(cwd, defaultSQLDir), nil
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func containsSQLFiles(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.EqualFold(filepath.Ext(entry.Name()), ".sql") {
+			return true
+		}
+	}
+	return false
 }
 
 func loadQueryFiles(dir string) ([]QueryFile, error) {
@@ -224,6 +299,7 @@ func renderView(w http.ResponseWriter, db *sql.DB, queryFile QueryFile) {
 	}
 
 	data := ViewPageData{
+		Name:    queryFile.Name,
 		Title:   queryFile.Title,
 		Query:   query,
 		Headers: headers,
@@ -234,13 +310,68 @@ func renderView(w http.ResponseWriter, db *sql.DB, queryFile QueryFile) {
 	}
 }
 
-func renderViewError(w http.ResponseWriter, title, query, message string) {
+func renderViewError(w http.ResponseWriter, name, query, message string) {
+	data := ViewPageData{
+		Name:  name,
+		Query: query,
+		Error: message,
+	}
+	if err := templates.ExecuteTemplate(w, "view", data); err != nil {
+		http.Error(w, fmt.Sprintf("template error: %v", err), http.StatusInternalServerError)
+	}
+}
+
+func renderIframe(w http.ResponseWriter, db *sql.DB, queryFile QueryFile) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	queryBytes, err := os.ReadFile(queryFile.Path)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("cannot read query file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	query := strings.TrimSpace(string(queryBytes))
+	if query == "" {
+		http.Error(w, "query file is empty", http.StatusBadRequest)
+		return
+	}
+
+	if !isSelectQuery(query) {
+		http.Error(w, "only SELECT or WITH queries are permitted", http.StatusBadRequest)
+		return
+	}
+
+	rows, err := db.QueryContext(context.Background(), query)
+	if err != nil {
+		renderIframeError(w, queryFile.Name, query, fmt.Sprintf("query execution failed: %v", err))
+		return
+	}
+	defer rows.Close()
+
+	headers, records, err := scanRows(rows)
+	if err != nil {
+		renderIframeError(w, queryFile.Name, query, fmt.Sprintf("failed to read results: %v", err))
+		return
+	}
+
+	data := ViewPageData{
+		Name:    queryFile.Name,
+		Title:   queryFile.Title,
+		Query:   query,
+		Headers: headers,
+		Rows:    records,
+	}
+	if err := templates.ExecuteTemplate(w, "iframe", data); err != nil {
+		http.Error(w, fmt.Sprintf("template error: %v", err), http.StatusInternalServerError)
+	}
+}
+
+func renderIframeError(w http.ResponseWriter, title, query, message string) {
 	data := ViewPageData{
 		Title: title,
 		Query: query,
 		Error: message,
 	}
-	if err := templates.ExecuteTemplate(w, "view", data); err != nil {
+	if err := templates.ExecuteTemplate(w, "iframe", data); err != nil {
 		http.Error(w, fmt.Sprintf("template error: %v", err), http.StatusInternalServerError)
 	}
 }
@@ -285,13 +416,14 @@ func scanRows(rows *sql.Rows) ([]string, [][]string, error) {
 	return cols, records, nil
 }
 
-const pageTemplates = `{{define "layout"}}
+const pageTemplates = `{{define "list"}}
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{{.Title}}</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <title>SQL View</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem; background: #f6f7fb; color: #111; }
     h1, h2 { margin-top: 0; }
@@ -308,40 +440,100 @@ const pageTemplates = `{{define "layout"}}
 </head>
 <body>
   <div class="container">
-    {{template "content" .}}
+    <h1>SQL View</h1>
+    <ul>
+    {{- range .Queries }}
+      <li><a href="/view/{{ .Name | pathEscape }}">{{ .Title }}</a></li>
+    {{- else }}
+      <li>Aucun fichier SQL trouvé.</li>
+    {{- end }}
+    </ul>
+    <div class="notice">
+      <strong>Note :</strong> chaque fichier SQL doit contenir une requête <code>SELECT</code> ou <code>WITH</code>.
+    </div>
   </div>
 </body>
 </html>
 {{end}}
 
-{{define "list"}}
-{{template "layout" .}}
-{{define "content"}}
-  <h1>SQL View</h1>
-  <p>Fichiers SQL disponibles :</p>
-  <ul>
-  {{- range .Queries }}
-    <li><a href="/view/{{ .Name | pathEscape }}">{{ .Title }}</a></li>
-  {{- else }}
-    <li>Aucun fichier SQL trouvé.</li>
-  {{- end }}
-  </ul>
-  <div class="notice">
-    <strong>Note :</strong> chaque fichier SQL doit contenir une requête <code>SELECT</code> ou <code>WITH</code>.
+{{define "view"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <title>{{ .Title }}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem; background: #f6f7fb; color: #111; }
+    h1, h2 { margin-top: 0; }
+    a { color: #0066cc; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .container { max-width: 1500px; margin: auto; overflow-x: auto; padding: 1rem; background: #fff; border-radius: 14px; box-shadow: 0 10px 30px rgba(0,0,0,.08); }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ddd; padding: 0.75rem; text-align: left; }
+    th { background: #f4f6fb; }
+    pre { background: #f0f3ff; padding: 1rem; overflow-x: auto; border-radius: 8px; }
+    .notice { margin-top: 1rem; padding: 1rem; background: #fff4e5; border: 1px solid #ffd8a8; border-radius: 10px; }
+    .error { color: #a03838; background: #ffe9e9; border: 1px solid #f5c2c7; padding: 1rem; border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>{{ .Title }}</h1>
+    <p><a href="/">← Retour à la liste</a><br><a href="/iframe/{{ .Name | pathEscape }}">→ Voir table seule</a></p>
+    {{ if .Error }}
+      <div class="error">{{ .Error }}</div>
+    {{ else }}
+      <h2>Requête</h2>
+      <pre>{{ .Query }}</pre>
+      {{ if .Headers }}
+        <table>
+          <thead>
+            <tr>
+              {{ range .Headers }}<th>{{ . }}</th>{{ end }}
+            </tr>
+          </thead>
+          <tbody>
+            {{ range .Rows }}
+              <tr>
+                {{ range . }}<td>{{ . }}</td>{{ end }}
+              </tr>
+            {{ else }}
+              <tr><td colspan="{{ len $.Headers }}">Aucune ligne retournée.</td></tr>
+            {{ end }}
+          </tbody>
+        </table>
+      {{ else }}
+        <div class="notice">Aucun résultat à afficher.</div>
+      {{ end }}
+    {{ end }}
   </div>
-{{end}}
+</body>
+</html>
 {{end}}
 
-{{define "view"}}
-{{template "layout" .}}
-{{define "content"}}
-  <h1>{{ .Title }}</h1>
-  <p><a href="/">← Retour à la liste</a></p>
+{{define "iframe"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <title>{{ .Title }}</title>
+  <style>
+    body { margin: 0; padding: 0.75rem; font-family: system-ui, sans-serif; background: #fff; color: #111; }
+    table { border-collapse: collapse; width: 100%; min-width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 0.5rem; text-align: left; }
+    th { background: #f4f6fb; }
+    tr:nth-child(even) { background: #fbfbfb; }
+    .error { color: #a03838; background: #ffe9e9; border: 1px solid #f5c2c7; padding: 0.75rem; border-radius: 8px; }
+  </style>
+</head>
+<body>
   {{ if .Error }}
     <div class="error">{{ .Error }}</div>
   {{ else }}
-    <h2>Requête</h2>
-    <pre>{{ .Query }}</pre>
     {{ if .Headers }}
       <table>
         <thead>
@@ -360,9 +552,10 @@ const pageTemplates = `{{define "layout"}}
         </tbody>
       </table>
     {{ else }}
-      <div class="notice">Aucun résultat à afficher.</div>
+      <div>Aucun résultat à afficher.</div>
     {{ end }}
   {{ end }}
-{{end}}
+</body>
+</html>
 {{end}}
 `
